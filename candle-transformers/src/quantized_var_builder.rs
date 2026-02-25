@@ -32,6 +32,26 @@ impl VarBuilder {
         })
     }
 
+    pub fn from_gguf_with_rename<P, F>(p: P, device: &Device, rename_fn: F) -> Result<Self>
+    where
+        P: AsRef<std::path::Path>,
+        F: Fn(&str) -> String,
+    {
+        let mut file = std::fs::File::open(p)?;
+        let content = candle::quantized::gguf_file::Content::read(&mut file)?;
+        let mut data = std::collections::HashMap::new();
+        for tensor_name in content.tensor_infos.keys() {
+            let tensor = content.tensor(&mut file, tensor_name, device)?;
+            let renamed = rename_fn(tensor_name);
+            data.insert(renamed, Arc::new(tensor));
+        }
+        Ok(Self {
+            data: Arc::new(data),
+            path: Vec::new(),
+            device: device.clone(),
+        })
+    }
+
     pub fn from_gguf_buffer(buffer: &[u8], device: &Device) -> Result<Self> {
         let mut cursor = std::io::Cursor::new(buffer);
         let content = candle::quantized::gguf_file::Content::read(&mut cursor)?;
