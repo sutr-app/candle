@@ -130,6 +130,76 @@ impl MultiHeadAttention {
         Ok(wv)
     }
 
+    // Same as qkv_attention but also returns the attention weights (softmax output)
+    fn qkv_attention_with_weights(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let (_, n_ctx, n_state) = q.dims3()?;
+        let scale = ((n_state / self.n_head) as f64).powf(-0.25);
+        let q = (self.reshape_head(q)? * scale)?;
+        let k = (self.reshape_head(k)?.transpose(2, 3)? * scale)?;
+        let v = self.reshape_head(v)?.contiguous()?;
+        let mut qk = {
+            let _enter = self.matmul_span.enter();
+            q.matmul(&k)?
+        };
+        if let Some(mask) = mask {
+            let mask = mask.i((0..n_ctx, 0..n_ctx))?;
+            qk = qk.broadcast_add(&mask)?
+        }
+        let w = {
+            let _enter = self.softmax_span.enter();
+            candle_nn::ops::softmax_last_dim(&qk)?
+        };
+        let wv = {
+            let _enter = self.matmul_span.enter();
+            w.matmul(&v)?
+        }
+        .transpose(1, 2)?
+        .flatten_from(2)?;
+        Ok((wv, w))
+    }
+
+    // Same as forward but also returns attention weights: (output, weights)
+    // weights shape: (batch, n_head, seq_len, source_len)
+    fn forward_with_attn_weights(
+        &mut self,
+        x: &Tensor,
+        xa: Option<&Tensor>,
+        mask: Option<&Tensor>,
+        flush_cache: bool,
+    ) -> Result<(Tensor, Tensor)> {
+        let _enter = self.span.enter();
+        let q = self.query.forward(x)?;
+        let (k, v) = match xa {
+            None => {
+                let k = self.key.forward(x)?;
+                let v = self.value.forward(x)?;
+                (k, v)
+            }
+            Some(x) => {
+                if flush_cache {
+                    self.kv_cache = None;
+                }
+                if let Some((k, v)) = &self.kv_cache {
+                    (k.clone(), v.clone())
+                } else {
+                    let k = self.key.forward(x)?;
+                    let v = self.value.forward(x)?;
+                    self.kv_cache = Some((k.clone(), v.clone()));
+                    (k, v)
+                }
+            }
+        };
+        let (wv, w) = self.qkv_attention_with_weights(&q, &k, &v, mask)?;
+        let out = self.out.forward(&wv)?;
+        Ok((out, w))
+    }
+
     fn reset_kv_cache(&mut self) {
         self.kv_cache = None;
     }
@@ -196,6 +266,36 @@ impl ResidualAttentionBlock {
                 .gelu()?,
         )?;
         x + mlp
+    }
+
+    // Same as forward but returns cross-attention weights if cross_attn exists
+    fn forward_with_cross_attn_weights(
+        &mut self,
+        x: &Tensor,
+        xa: Option<&Tensor>,
+        mask: Option<&Tensor>,
+        flush_kv_cache: bool,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let _enter = self.span.enter();
+        let attn = self
+            .attn
+            .forward(&self.attn_ln.forward(x)?, None, mask, flush_kv_cache)?;
+        let mut x = (x + attn)?;
+        let cross_attn_weights = if let Some((attn, ln)) = &mut self.cross_attn {
+            let (ca_out, w) =
+                attn.forward_with_attn_weights(&ln.forward(&x)?, xa, None, flush_kv_cache)?;
+            x = (&x + ca_out)?;
+            Some(w)
+        } else {
+            None
+        };
+        let mlp = self.mlp_linear2.forward(
+            &self
+                .mlp_linear1
+                .forward(&self.mlp_ln.forward(&x)?)?
+                .gelu()?,
+        )?;
+        Ok(((x + mlp)?, cross_attn_weights))
     }
 
     fn reset_kv_cache(&mut self) {
@@ -352,6 +452,42 @@ impl TextDecoder {
             x = block.forward(&x, Some(xa), Some(&self.mask), flush_kv_cache)?;
         }
         self.ln.forward(&x)
+    }
+
+    /// Same as forward but collects cross-attention weights from specified layers.
+    /// Returns (output, Vec<(layer_idx, weights)>) where weights shape is
+    /// (batch, n_head, seq_len, source_len).
+    pub fn forward_with_cross_attn(
+        &mut self,
+        x: &Tensor,
+        xa: &Tensor,
+        flush_kv_cache: bool,
+        alignment_layer_indices: &[usize],
+    ) -> Result<(Tensor, Vec<(usize, Tensor)>)> {
+        let _enter = self.span.enter();
+        let last = x.dim(D::Minus1)?;
+        let token_embedding = self.token_embedding.forward(x)?;
+        let positional_embedding = self.positional_embedding.narrow(0, 0, last)?;
+        let mut x = token_embedding.broadcast_add(&positional_embedding)?;
+        let mut collected_weights = Vec::new();
+        for (i, block) in self.blocks.iter_mut().enumerate() {
+            if alignment_layer_indices.contains(&i) {
+                let (out, w) = block.forward_with_cross_attn_weights(
+                    &x,
+                    Some(xa),
+                    Some(&self.mask),
+                    flush_kv_cache,
+                )?;
+                x = out;
+                if let Some(w) = w {
+                    collected_weights.push((i, w));
+                }
+            } else {
+                x = block.forward(&x, Some(xa), Some(&self.mask), flush_kv_cache)?;
+            }
+        }
+        let x = self.ln.forward(&x)?;
+        Ok((x, collected_weights))
     }
 
     pub fn final_linear(&self, x: &Tensor) -> Result<Tensor> {
